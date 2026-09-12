@@ -44,6 +44,20 @@ ALLDEBRID_MAX_CHECK=30
 
 Lorsque ce mode est actif, les limites Torznab sont automatiquement réduites afin de limiter le nombre de vérifications AllDebrid.
 
+## Image Docker
+
+L'image officielle est disponible sur Docker Hub :
+
+```text
+laster13/streamfusion-torznab-indexer:latest
+```
+
+Pour télécharger l'image :
+
+```bash
+docker pull laster13/streamfusion-torznab-indexer:latest
+```
+
 ## Installation
 
 Créer la configuration locale :
