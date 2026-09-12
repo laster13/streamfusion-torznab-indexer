@@ -1,0 +1,34 @@
+services:
+  sf-torznab:
+    build: .
+    container_name: sf-torznab
+    restart: unless-stopped
+
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      INDEXER_NAME: ${INDEXER_NAME:-PostgreSQL Torznab}
+      INDEXER_API_KEY: ${INDEXER_API_KEY:-}
+      DEFAULT_LIMIT: ${DEFAULT_LIMIT:-100}
+      MAX_LIMIT: ${MAX_LIMIT:-200}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
+
+      ALLDEBRID_API_KEY: ${ALLDEBRID_API_KEY:-}
+      ALLDEBRID_CACHE_ONLY: ${ALLDEBRID_CACHE_ONLY:-false}
+      ALLDEBRID_CHECK_LIMIT: ${ALLDEBRID_CHECK_LIMIT:-30}
+      ALLDEBRID_BATCH_SIZE: ${ALLDEBRID_BATCH_SIZE:-10}
+      ALLDEBRID_MAX_CHECK: ${ALLDEBRID_MAX_CHECK:-30}
+
+    ports:
+      - "8787:8080"
+
+    networks:
+      - sfr-dev
+      - traefik_proxy
+
+networks:
+  sfr-dev:
+    external: true
+
+  traefik_proxy:
+    external: true
