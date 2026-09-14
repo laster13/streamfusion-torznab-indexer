@@ -14,6 +14,7 @@ from fastapi.responses import Response
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from xml.etree.ElementTree import Element, SubElement, tostring, register_namespace
+from app.alldebrid_global_quota import acquire_alldebrid_global_quota
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -28,6 +29,27 @@ ALLDEBRID_API_KEY = os.getenv(
     "ALLDEBRID_API_KEY",
     ""
 ).strip()
+
+
+ALLDEBRID_BROKER_URL = os.getenv(
+    "ALLDEBRID_BROKER_URL",
+    "http://sf-alldebrid-broker:8080",
+).strip().rstrip("/")
+
+ALLDEBRID_BROKER_TOKEN = os.getenv(
+    "ALLDEBRID_BROKER_TOKEN",
+    "",
+).strip()
+
+ALLDEBRID_BROKER_TIMEOUT = max(
+    5.0,
+    float(
+        os.getenv(
+            "ALLDEBRID_BROKER_TIMEOUT",
+            "45",
+        )
+    ),
+)
 
 ALLDEBRID_CACHE_ONLY = os.getenv(
     "ALLDEBRID_CACHE_ONLY",
@@ -244,7 +266,7 @@ def magnet(row: dict[str, Any]) -> str:
 ALLDEBRID_SAFE_UPLOAD_BATCH = 10
 ALLDEBRID_SAFE_MAX_CHECK = 30
 ALLDEBRID_CAPACITY_GUARD = 950
-ALLDEBRID_BACKOFF_SECONDS = 900
+ALLDEBRID_BACKOFF_SECONDS = 60
 ALLDEBRID_BLOCKED_UNTIL = 0.0
 ALLDEBRID_LOCK = asyncio.Lock()
 
@@ -252,24 +274,12 @@ ALLDEBRID_LOCK = asyncio.Lock()
 # On garde une marge de sécurité à ~9 req/s.
 ALLDEBRID_RATE_LOCK = asyncio.Lock()
 ALLDEBRID_LAST_REQUEST_AT = 0.0
-ALLDEBRID_MIN_REQUEST_INTERVAL = 0.115
+ALLDEBRID_MIN_REQUEST_INTERVAL = 0.25
+
 
 
 async def alldebrid_rate_wait() -> None:
-    global ALLDEBRID_LAST_REQUEST_AT
-
-    async with ALLDEBRID_RATE_LOCK:
-        now = time.monotonic()
-
-        delay = (
-            ALLDEBRID_MIN_REQUEST_INTERVAL
-            - (now - ALLDEBRID_LAST_REQUEST_AT)
-        )
-
-        if delay > 0:
-            await asyncio.sleep(delay)
-
-        ALLDEBRID_LAST_REQUEST_AT = time.monotonic()
+    await acquire_alldebrid_global_quota()
 
 
 def _valid_btih(value: str) -> bool:
@@ -338,12 +348,180 @@ async def alldebrid_delete_magnet(
     body = response.json()
 
     if body.get("status") != "success":
+        error = body.get("error") or {}
+        if error.get("code") == "MAGNET_INVALID_ID":
+            print(
+                "[ALLDEBRID][DELETE-IDEMPOTENT] "
+                f"id={magnet_id} already_absent"
+            )
+            return
+
         raise RuntimeError(
             f"Echec suppression magnet {magnet_id}: {body}"
         )
 
 
+
 async def alldebrid_cached_hashes(
+    rows: list[dict[str, Any]],
+) -> tuple[set[str], set[str]]:
+    """
+    Chemin principal : broker partagé.
+    Repli : ancienne logique locale intacte.
+    """
+
+    if not rows:
+        return set(), set()
+
+    hashes: list[str] = []
+    seen: set[str] = set()
+
+    for row in rows:
+        h = str(
+            row.get("info_hash")
+            or ""
+        ).strip().lower()
+
+        if not _valid_btih(h):
+            continue
+
+        if h in seen:
+            continue
+
+        seen.add(h)
+        hashes.append(h)
+
+        if (
+            len(hashes)
+            >= ALLDEBRID_SAFE_MAX_CHECK
+        ):
+            break
+
+    if not hashes:
+        return set(), set()
+
+    if (
+        not ALLDEBRID_BROKER_URL
+        or not ALLDEBRID_BROKER_TOKEN
+    ):
+        print(
+            "[ALLDEBRID]"
+            "[BROKER-DISABLED] "
+            "fallback local"
+        )
+
+        return (
+            await
+            alldebrid_cached_hashes_local(
+                rows
+            )
+        )
+
+    wanted = set(hashes)
+
+    try:
+        started = time.perf_counter()
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                ALLDEBRID_BROKER_TIMEOUT
+            )
+        ) as client:
+
+            response = await client.post(
+                ALLDEBRID_BROKER_URL
+                + "/v1/check",
+                headers={
+                    "Authorization":
+                        "Bearer "
+                        + ALLDEBRID_BROKER_TOKEN
+                },
+                json={
+                    "hashes": hashes,
+                },
+            )
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                "broker HTTP "
+                f"{response.status_code}"
+            )
+
+        body = response.json()
+
+        cached = {
+            str(h).strip().lower()
+            for h in (
+                body.get("cached")
+                or []
+            )
+            if _valid_btih(
+                str(h).strip().lower()
+            )
+        }
+
+        uncached = {
+            str(h).strip().lower()
+            for h in (
+                body.get("uncached")
+                or []
+            )
+            if _valid_btih(
+                str(h).strip().lower()
+            )
+        }
+
+        if cached & uncached:
+            raise RuntimeError(
+                "classification broker "
+                "contradictoire"
+            )
+
+        classified = (
+            cached
+            | uncached
+        )
+
+        if classified != wanted:
+            raise RuntimeError(
+                "classification broker "
+                "incomplète "
+                f"{len(classified)}/"
+                f"{len(wanted)}"
+            )
+
+        elapsed = (
+            time.perf_counter()
+            - started
+        )
+
+        print(
+            "[ALLDEBRID][BROKER] "
+            f"requested={len(wanted)} "
+            f"cached={len(cached)} "
+            f"uncached={len(uncached)} "
+            f"time={elapsed:.3f}s"
+        )
+
+        return cached, uncached
+
+    except Exception as exc:
+        print(
+            "[ALLDEBRID]"
+            "[BROKER-FALLBACK] "
+            f"{type(exc).__name__}: "
+            f"{exc}"
+        )
+
+        return (
+            await
+            alldebrid_cached_hashes_local(
+                rows
+            )
+        )
+
+
+async def alldebrid_cached_hashes_local(
     rows: list[dict[str, Any]],
 ) -> tuple[set[str], set[str]]:
     global ALLDEBRID_BLOCKED_UNTIL

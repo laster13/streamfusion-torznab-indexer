@@ -1,23 +1,43 @@
 services:
+
   sf-torznab:
-    build: .
+    image: "${TORZNAB_IMAGE:-laster13/streamfusion-torznab-indexer:latest}"
     container_name: sf-torznab
     restart: unless-stopped
 
-    environment:
-      DATABASE_URL: ${DATABASE_URL}
-      INDEXER_NAME: ${INDEXER_NAME:-PostgreSQL Torznab}
-      INDEXER_API_KEY: ${INDEXER_API_KEY:-}
-      DEFAULT_LIMIT: ${DEFAULT_LIMIT:-100}
-      MAX_LIMIT: ${MAX_LIMIT:-200}
-      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --no-access-log
 
-      ALLDEBRID_API_KEY: ${ALLDEBRID_API_KEY:-}
-      ALLDEBRID_CACHE_ONLY: ${ALLDEBRID_CACHE_ONLY:-false}
-      ALLDEBRID_CHECK_LIMIT: ${ALLDEBRID_CHECK_LIMIT:-30}
-      ALLDEBRID_BATCH_SIZE: ${ALLDEBRID_BATCH_SIZE:-10}
-      ALLDEBRID_MAX_CHECK: ${ALLDEBRID_MAX_CHECK:-30}
+    environment:
+      DATABASE_URL: "${DATABASE_URL:?DATABASE_URL is required}"
+
+      INDEXER_NAME: "${INDEXER_NAME:-PostgreSQL Torznab}"
+      INDEXER_API_KEY: "${INDEXER_API_KEY:-}"
+
+      DEFAULT_LIMIT: "${DEFAULT_LIMIT:-100}"
+      MAX_LIMIT: "${MAX_LIMIT:-200}"
+      DB_POOL_SIZE: "${DB_POOL_SIZE:-10}"
+      DB_MAX_OVERFLOW: "${DB_MAX_OVERFLOW:-20}"
+
+      ALLDEBRID_API_KEY: "${ALLDEBRID_API_KEY:?ALLDEBRID_API_KEY is required}"
+      ALLDEBRID_CACHE_ONLY: "${ALLDEBRID_CACHE_ONLY:-false}"
+      ALLDEBRID_CHECK_LIMIT: "${ALLDEBRID_CHECK_LIMIT:-30}"
+      ALLDEBRID_BATCH_SIZE: "${ALLDEBRID_BATCH_SIZE:-10}"
+      ALLDEBRID_MAX_CHECK: "${ALLDEBRID_MAX_CHECK:-30}"
+
+      ALLDEBRID_BROKER_URL: "http://sf-alldebrid-broker:8080"
+      ALLDEBRID_BROKER_TOKEN: "${ALLDEBRID_BROKER_TOKEN:?ALLDEBRID_BROKER_TOKEN is required}"
+      ALLDEBRID_BROKER_TIMEOUT: "45"
+
+      ALLDEBRID_GLOBAL_REDIS_URL: "redis://sfr-redis-dev:6379/0"
+      ALLDEBRID_GLOBAL_SECOND_LIMIT: "8"
+      ALLDEBRID_GLOBAL_MINUTE_LIMIT: "450"
 
     ports:
       - "8787:8080"
@@ -26,9 +46,123 @@ services:
       - sfr-dev
       - traefik_proxy
 
+
+  sf-torznab-meili:
+    image: "${TORZNAB_IMAGE:-laster13/streamfusion-torznab-indexer:latest}"
+    container_name: sf-torznab-meili
+    restart: unless-stopped
+
+    command:
+      - uvicorn
+      - app.meili_main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --no-access-log
+
+    environment:
+      INDEXER_NAME: "StreamFusion Meilisearch FR"
+      INDEXER_API_KEY: "${MEILI_INDEXER_API_KEY:?MEILI_INDEXER_API_KEY is required}"
+
+      MEILI_URL: "http://sfr-meilisearch-dev:7700"
+      MEILI_INDEX: "torrents"
+      MEILI_API_KEY: "${MEILI_TORZNAB_SEARCH_KEY:?MEILI_TORZNAB_SEARCH_KEY is required}"
+
+      DATABASE_URL: "${DATABASE_URL:?DATABASE_URL is required}"
+
+      DEFAULT_LIMIT: "100"
+      MAX_LIMIT: "200"
+      MEILI_CANDIDATE_LIMIT: "600"
+      MEILI_TIMEOUT: "10"
+      PG_SEEDERS_REQUIRED: "false"
+      ACCEPT_MULTI_WITHOUT_LANG: "true"
+
+      ALLDEBRID_API_KEY: "${ALLDEBRID_API_KEY:?ALLDEBRID_API_KEY is required}"
+      ALLDEBRID_CACHE_ONLY: "${ALLDEBRID_CACHE_ONLY:-false}"
+      ALLDEBRID_CHECK_LIMIT: "${ALLDEBRID_CHECK_LIMIT:-30}"
+      ALLDEBRID_BATCH_SIZE: "${ALLDEBRID_BATCH_SIZE:-10}"
+      ALLDEBRID_MAX_CHECK: "${ALLDEBRID_MAX_CHECK:-30}"
+
+      ALLDEBRID_BROKER_URL: "http://sf-alldebrid-broker:8080"
+      ALLDEBRID_BROKER_TOKEN: "${ALLDEBRID_BROKER_TOKEN:?ALLDEBRID_BROKER_TOKEN is required}"
+      ALLDEBRID_BROKER_TIMEOUT: "45"
+
+      ALLDEBRID_GLOBAL_REDIS_URL: "redis://sfr-redis-dev:6379/0"
+      ALLDEBRID_GLOBAL_SECOND_LIMIT: "8"
+      ALLDEBRID_GLOBAL_MINUTE_LIMIT: "450"
+
+    ports:
+      - "8788:8080"
+
+    read_only: true
+
+    tmpfs:
+      - /tmp:mode=1777
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    networks:
+      - torznab-runtime
+
+
+  sf-alldebrid-broker:
+    image: "${TORZNAB_IMAGE:-laster13/streamfusion-torznab-indexer:latest}"
+    container_name: sf-alldebrid-broker
+    restart: unless-stopped
+
+    command:
+      - uvicorn
+      - app.alldebrid_broker:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --no-access-log
+
+    environment:
+      DATABASE_URL: "${DATABASE_URL:?DATABASE_URL is required}"
+      ALLDEBRID_API_KEY: "${ALLDEBRID_API_KEY:?ALLDEBRID_API_KEY is required}"
+      BROKER_TOKEN: "${ALLDEBRID_BROKER_TOKEN:?ALLDEBRID_BROKER_TOKEN is required}"
+
+      REDIS_URL: "redis://sfr-redis-dev:6379/0"
+
+      ALLDEBRID_GLOBAL_REDIS_URL: "redis://sfr-redis-dev:6379/0"
+      ALLDEBRID_GLOBAL_SECOND_LIMIT: "8"
+      ALLDEBRID_GLOBAL_MINUTE_LIMIT: "450"
+
+      BROKER_BATCH_SIZE: "20"
+      BROKER_PARALLEL_BATCHES: "4"
+      BROKER_COALESCE_MS: "80"
+      BROKER_POSITIVE_TTL: "300"
+
+    read_only: true
+
+    tmpfs:
+      - /tmp:mode=1777
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    networks:
+      - sfr-dev
+
+
 networks:
+
   sfr-dev:
     external: true
 
   traefik_proxy:
     external: true
+
+  torznab-runtime:
+    external: true
+    name: "${TORZNAB_NETWORK:?TORZNAB_NETWORK is required}"

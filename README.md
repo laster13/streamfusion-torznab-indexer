@@ -1,205 +1,879 @@
-# StreamFusion PostgreSQL Torznab Indexer
+# StreamFusion Torznab Indexer
 
-Indexeur Torznab pour **Prowlarr**, basé sur la table PostgreSQL `torrent_items` de StreamFusion.
+Passerelle Torznab pour **Prowlarr, Sonarr et Radarr**, utilisant les données de StreamFusion.
 
-Il permet à Prowlarr, Sonarr et Radarr d'effectuer des recherches directement dans la base PostgreSQL StreamFusion.
+Le projet fournit deux indexeurs Torznab complémentaires :
 
-## Fonctionnement
+- **PostgreSQL**
+- **Meilisearch**
 
-Les torrents **sans TMDB et sans IMDb sont inclus**.
+Les vérifications de disponibilité instantanée sur **AllDebrid** sont centralisées par un broker interne afin de partager le cache, éviter les vérifications inutiles et limiter la pression sur l'API AllDebrid.
 
-Les identifiants externes servent à accélérer et améliorer la précision des recherches, mais ne constituent jamais une condition obligatoire.
+---
 
-La recherche utilise notamment :
+# Architecture
 
-1. `imdb_id` / `tmdb_id` lorsqu'ils sont disponibles ;
-2. `parsed_data.normalized_title` ;
-3. `parsed_data.parsed_title` ;
-4. `raw_title` ;
-5. l'année lorsqu'elle est fournie ou détectée dans une recherche texte ;
-6. les saisons et épisodes présents dans `parsed_data`, avec fallback `SxxEyy` dans le titre.
-
-Les recherches texte de type :
+Le projet utilise :
 
 ```text
-Le Grand Escogriffe 1976
+1 dépôt
+1 Dockerfile
+1 requirements.txt
+1 docker-compose.yml
+1 .env
+1 image Docker
 ```
 
-peuvent également rechercher le titre sans l'année tout en conservant le contrôle de l'année.
+La même image Docker contient les trois applications Python.
 
-Les résultats sont dédupliqués par `info_hash`, en privilégiant notamment les entrées ayant le meilleur classement et le plus de seeders.
+Elle est exécutée dans **3 conteneurs distincts** :
 
-## Filtrage AllDebrid
+| Conteneur | Rôle | Port hôte |
+|---|---|---:|
+| `sf-torznab` | Indexeur PostgreSQL Torznab | `8787` |
+| `sf-torznab-meili` | Indexeur Meilisearch Torznab | `8788` |
+| `sf-alldebrid-broker` | Broker AllDebrid interne | aucun |
 
-Le mode cache AllDebrid peut être activé afin de ne retourner à Prowlarr que les torrents disponibles instantanément sur AllDebrid.
+Il ne s'agit donc **pas d'un seul conteneur exécutant trois processus**.
 
-Configuration recommandée :
-
-```env
-ALLDEBRID_CACHE_ONLY=true
-ALLDEBRID_CHECK_LIMIT=30
-ALLDEBRID_BATCH_SIZE=10
-ALLDEBRID_MAX_CHECK=30
-```
-
-Lorsque ce mode est actif, les limites Torznab sont automatiquement réduites afin de limiter le nombre de vérifications AllDebrid.
+Chaque service possède son propre processus Uvicorn.
 
 ## Image Docker
 
-L'image officielle est disponible sur Docker Hub :
+Image prévue pour la publication :
 
 ```text
 laster13/streamfusion-torznab-indexer:latest
 ```
 
-Pour télécharger l'image :
+Architecture de l'image :
 
-```bash
-docker pull laster13/streamfusion-torznab-indexer:latest
+```text
+linux/amd64
+linux/arm64
 ```
 
-## Installation
+---
 
-Créer la configuration locale :
+# Schéma
+
+```text
+                         ┌─────────────────────┐
+                         │      Prowlarr       │
+                         └──────────┬──────────┘
+                                    │
+                  ┌─────────────────┴─────────────────┐
+                  │                                   │
+                  ▼                                   ▼
+        ┌───────────────────┐              ┌──────────────────────┐
+        │    sf-torznab     │              │ sf-torznab-meili    │
+        │    PostgreSQL     │              │    Meilisearch      │
+        │    port 8787      │              │    port 8788         │
+        └─────────┬─────────┘              └──────────┬───────────┘
+                  │                                   │
+                  └─────────────────┬─────────────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │ sf-alldebrid-broker │
+                         │   réseau interne    │
+                         └──────────┬───────────┘
+                                    │
+                          ┌─────────┴─────────┐
+                          │                   │
+                          ▼                   ▼
+                        Redis             AllDebrid
+```
+
+Les indexeurs conservent également un **fallback local AllDebrid** si le broker devient temporairement indisponible.
+
+---
+
+# Services
+
+## 1. `sf-torznab`
+
+Indexeur Torznab utilisant directement PostgreSQL StreamFusion.
+
+Application Python :
+
+```text
+app.main:app
+```
+
+Port interne :
+
+```text
+8080
+```
+
+Port publié sur l'hôte :
+
+```text
+8787
+```
+
+URL depuis l'hôte :
+
+```text
+http://127.0.0.1:8787
+```
+
+---
+
+## 2. `sf-torznab-meili`
+
+Indexeur Torznab utilisant Meilisearch.
+
+Application Python :
+
+```text
+app.meili_main:app
+```
+
+Port interne :
+
+```text
+8080
+```
+
+Port publié sur l'hôte :
+
+```text
+8788
+```
+
+URL depuis l'hôte :
+
+```text
+http://127.0.0.1:8788
+```
+
+---
+
+## 3. `sf-alldebrid-broker`
+
+Broker interne chargé de centraliser les vérifications AllDebrid.
+
+Application Python :
+
+```text
+app.alldebrid_broker:app
+```
+
+Le broker :
+
+- n'expose aucun port sur l'hôte ;
+- communique avec les indexeurs sur le réseau Docker ;
+- utilise Redis ;
+- peut lire les disponibilités positives déjà présentes ;
+- regroupe les vérifications AllDebrid ;
+- évite plusieurs vérifications simultanées du même hash ;
+- gère le nettoyage de ses magnets temporaires ;
+- applique le quota global AllDebrid.
+
+---
+
+# PostgreSQL
+
+L'indexeur PostgreSQL utilise la base StreamFusion.
+
+La connexion est fournie par :
+
+```text
+DATABASE_URL
+```
+
+La table principale utilisée est :
+
+```text
+torrent_items
+```
+
+Le projet **ne possède pas sa propre base de torrents**.
+
+Il exploite notamment :
+
+- `imdb_id`
+- `tmdb_id`
+- `parsed_data.normalized_title`
+- `parsed_data.parsed_title`
+- `raw_title`
+- année
+- saison
+- épisode
+- `info_hash`
+- seeders
+- taille
+- type
+
+Les torrents sans TMDB ou IMDb peuvent également être retournés.
+
+Les identifiants externes améliorent la précision mais ne sont pas obligatoires.
+
+---
+
+# Meilisearch
+
+L'indexeur Meilisearch interroge l'index :
+
+```text
+torrents
+```
+
+Le Compose actuel attend Meilisearch à l'adresse interne :
+
+```text
+http://sfr-meilisearch-dev:7700
+```
+
+Une clé de recherche dédiée doit être fournie avec :
+
+```text
+MEILI_TORZNAB_SEARCH_KEY
+```
+
+Cette clé devrait idéalement être limitée aux opérations de recherche nécessaires.
+
+---
+
+# AllDebrid
+
+## Mode cache-only
+
+Lorsque :
+
+```env
+ALLDEBRID_CACHE_ONLY=true
+```
+
+les indexeurs ne retournent que les torrents considérés comme disponibles instantanément sur AllDebrid.
+
+Paramètres disponibles :
+
+```env
+ALLDEBRID_CHECK_LIMIT=30
+ALLDEBRID_BATCH_SIZE=10
+ALLDEBRID_MAX_CHECK=30
+```
+
+---
+
+# Broker AllDebrid
+
+Le broker centralise les appels effectués par les deux indexeurs.
+
+Fonctions principales :
+
+| Fonction | Description |
+|---|---|
+| Cache positif Redis | évite de revérifier rapidement un hash connu |
+| Cache StreamFusion | réutilise les disponibilités positives connues |
+| PostgreSQL | peut réutiliser les informations positives disponibles |
+| Single-flight | évite plusieurs vérifications simultanées du même hash |
+| Batching | groupe les hashes |
+| Cleanup | nettoie les magnets temporaires du broker |
+| Capacity recovery | récupère de la capacité si AllDebrid refuse de nouveaux magnets |
+| Authentification | protège le broker avec un token interne |
+
+Le broker ne doit supprimer **que les magnets temporaires qu'il a lui-même créés**.
+
+Il ne doit pas supprimer :
+
+- les magnets de l'utilisateur ;
+- les magnets créés par StreamFusion ;
+- les magnets appartenant à d'autres applications.
+
+Le broker **n'écrit pas dans `debrid_cache` de StreamFusion**.
+
+---
+
+# Quota AllDebrid
+
+Les trois services de ce projet utilisent un limiteur Redis partagé.
+
+Configuration actuelle :
+
+```text
+8 requêtes / seconde
+450 requêtes / minute
+```
+
+Services concernés :
+
+```text
+sf-torznab
+sf-torznab-meili
+sf-alldebrid-broker
+```
+
+Ce mécanisme permet d'éviter que plusieurs conteneurs dépassent indépendamment les limites AllDebrid.
+
+## Important
+
+**StreamFusion lui-même ne participe pas à ce quota partagé.**
+
+Si StreamFusion utilise la même clé AllDebrid simultanément, ses appels viennent donc s'ajouter aux appels de ce projet.
+
+---
+
+# Redis
+
+Le broker et le quota global utilisent Redis.
+
+Instance actuellement attendue :
+
+```text
+redis://sfr-redis-dev:6379/0
+```
+
+Clé de cleanup :
+
+```text
+sf:torznab:alldebrid:cleanup
+```
+
+Clé du quota :
+
+```text
+sf:alldebrid:global-quota:requests
+```
+
+---
+
+# Prérequis
+
+Les services suivants doivent déjà exister :
+
+- PostgreSQL StreamFusion ;
+- Redis ;
+- Meilisearch ;
+- réseau Docker StreamFusion ;
+- éventuellement `traefik_proxy`.
+
+Le projet **ne crée pas PostgreSQL, Redis ou Meilisearch**.
+
+---
+
+# Installation
+
+Cloner le dépôt :
+
+```bash
+git clone https://github.com/laster13/streamfusion-torznab-indexer.git
+cd streamfusion-torznab-indexer
+```
+
+Créer le fichier de configuration :
 
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-Construire et démarrer le service :
+Le fichier :
 
-```bash
-docker compose up -d --build
+```text
+.env
 ```
 
-Vérifier son état :
+contient les véritables clés et mots de passe.
+
+**Il ne doit jamais être ajouté à Git.**
+
+---
+
+# Configuration `.env`
+
+Le fichier `.env.example` contient les variables nécessaires au Compose.
+
+## Docker
+
+```env
+TORZNAB_IMAGE=laster13/streamfusion-torznab-indexer:latest
+TORZNAB_NETWORK=sfr-dev
+```
+
+`TORZNAB_IMAGE` correspond à l'image utilisée par les trois conteneurs.
+
+`TORZNAB_NETWORK` correspond au réseau Docker permettant notamment à l'indexeur Meilisearch de communiquer avec le broker.
+
+---
+
+# PostgreSQL
+
+```env
+DATABASE_URL=postgresql+asyncpg://streamfusion:PASSWORD@postgresql-dev:5432/streamfusion
+
+DB_POOL_SIZE=10
+DB_MAX_OVERFLOW=20
+```
+
+Adapter impérativement :
+
+```text
+PASSWORD
+postgresql-dev
+streamfusion
+```
+
+à l'environnement utilisé.
+
+---
+
+# Indexeur PostgreSQL
+
+```env
+INDEXER_NAME=StreamFusion PostgreSQL
+INDEXER_API_KEY=change_me
+
+DEFAULT_LIMIT=100
+MAX_LIMIT=200
+```
+
+`INDEXER_API_KEY` protège l'accès à l'indexeur PostgreSQL.
+
+Une clé forte peut être générée avec :
+
+```bash
+openssl rand -hex 32
+```
+
+---
+
+# Indexeur Meilisearch
+
+```env
+MEILI_INDEXER_API_KEY=change_me
+MEILI_TORZNAB_SEARCH_KEY=change_me
+```
+
+`MEILI_INDEXER_API_KEY` est la clé Torznab utilisée par Prowlarr.
+
+`MEILI_TORZNAB_SEARCH_KEY` est la clé permettant à l'application d'effectuer les recherches dans Meilisearch.
+
+---
+
+# AllDebrid
+
+```env
+ALLDEBRID_API_KEY=change_me
+
+ALLDEBRID_CACHE_ONLY=true
+ALLDEBRID_CHECK_LIMIT=30
+ALLDEBRID_BATCH_SIZE=10
+ALLDEBRID_MAX_CHECK=30
+```
+
+`ALLDEBRID_API_KEY` ne doit jamais être publié.
+
+---
+
+# Authentification du broker
+
+```env
+ALLDEBRID_BROKER_TOKEN=change_me
+```
+
+Cette valeur doit être un secret aléatoire fort.
+
+Exemple :
+
+```bash
+openssl rand -hex 32
+```
+
+Le même token est transmis :
+
+- au broker ;
+- à l'indexeur PostgreSQL ;
+- à l'indexeur Meilisearch.
+
+Le broker n'est pas destiné à être exposé publiquement.
+
+---
+
+# Liste complète des variables
+
+Le Compose utilise actuellement exactement ces variables :
+
+```text
+ALLDEBRID_API_KEY
+ALLDEBRID_BATCH_SIZE
+ALLDEBRID_BROKER_TOKEN
+ALLDEBRID_CACHE_ONLY
+ALLDEBRID_CHECK_LIMIT
+ALLDEBRID_MAX_CHECK
+DATABASE_URL
+DB_MAX_OVERFLOW
+DB_POOL_SIZE
+DEFAULT_LIMIT
+INDEXER_API_KEY
+INDEXER_NAME
+MAX_LIMIT
+MEILI_INDEXER_API_KEY
+MEILI_TORZNAB_SEARCH_KEY
+TORZNAB_IMAGE
+TORZNAB_NETWORK
+```
+
+Soit :
+
+```text
+17 variables
+```
+
+---
+
+# Démarrage depuis Docker Hub
+
+Télécharger l'image :
+
+```bash
+docker compose pull
+```
+
+Démarrer les trois services :
+
+```bash
+docker compose up -d
+```
+
+Vérifier :
 
 ```bash
 docker compose ps
 ```
 
-## Tests
-
-Depuis l'hôte Docker :
-
-```bash
-curl "http://127.0.0.1:8787/health"
-```
-
-Tester les capacités Torznab :
-
-```bash
-curl "http://127.0.0.1:8787/torznab/api?t=caps&apikey=YOUR_API_KEY"
-```
-
-Tester une recherche générique :
-
-```bash
-curl "http://127.0.0.1:8787/torznab/api?t=search&q=Dr%20Stone&apikey=YOUR_API_KEY"
-```
-
-Tester une recherche série :
-
-```bash
-curl "http://127.0.0.1:8787/torznab/api?t=tvsearch&q=Dr%20Stone&season=4&ep=12&apikey=YOUR_API_KEY"
-```
-
-`YOUR_API_KEY` doit être remplacé par la valeur de `INDEXER_API_KEY` définie dans `.env`.
-
-Ne jamais publier le fichier `.env` ni une véritable clé API dans le dépôt Git.
-
-## Prowlarr
-
-Ajouter un indexeur **Generic Torznab**.
-
-Lorsque Prowlarr partage le même réseau Docker que `sf-torznab` :
+Les trois conteneurs attendus sont :
 
 ```text
-URL : http://sf-torznab:8080/torznab
-API Path : /api
-API Key : valeur de INDEXER_API_KEY
+sf-torznab
+sf-torznab-meili
+sf-alldebrid-broker
 ```
 
-L'URL Torznab complète utilisée en interne est donc :
+---
+
+# Construction locale
+
+Pour construire l'image depuis les sources :
+
+```bash
+docker build \
+  -t streamfusion-torznab-indexer:local \
+  .
+```
+
+Puis modifier temporairement `.env` :
+
+```env
+TORZNAB_IMAGE=streamfusion-torznab-indexer:local
+```
+
+et recréer les services :
+
+```bash
+docker compose up -d --force-recreate
+```
+
+---
+
+# Configuration Prowlarr
+
+Les deux indexeurs doivent être créés **séparément** dans Prowlarr.
+
+Type :
+
+```text
+Generic Torznab
+```
+
+---
+
+## Indexeur PostgreSQL
+
+Lorsque Prowlarr partage le réseau Docker :
+
+```text
+Name      : StreamFusion PostgreSQL
+URL       : http://sf-torznab:8080/torznab
+API Path  : /api
+API Key   : valeur de INDEXER_API_KEY
+```
+
+URL Torznab complète :
 
 ```text
 http://sf-torznab:8080/torznab/api
 ```
 
-Pour un accès depuis l'hôte Docker :
+Depuis l'hôte :
 
 ```text
 http://127.0.0.1:8787/torznab/api
 ```
 
-Les recherches RSS, automatiques et interactives peuvent être activées dans Prowlarr.
+---
 
-## PostgreSQL
+## Indexeur Meilisearch
 
-Configurer `DATABASE_URL` dans `.env` avec une adresse PostgreSQL accessible depuis le conteneur `sf-torznab`.
-
-Exemple :
-
-```env
-DATABASE_URL=postgresql+asyncpg://streamfusion:PASSWORD@postgresql:5432/streamfusion
-```
-
-L'indexeur utilise notamment la table :
+Lorsque Prowlarr partage le réseau Docker :
 
 ```text
-torrent_items
+Name      : StreamFusion Meilisearch
+URL       : http://sf-torznab-meili:8080/torznab
+API Path  : /api
+API Key   : valeur de MEILI_INDEXER_API_KEY
 ```
 
-Il ne possède pas de base PostgreSQL indépendante et ne stocke pas les torrents lui-même.
-
-## Limites
-
-Les paramètres principaux sont configurables dans `.env` :
-
-```env
-DEFAULT_LIMIT=100
-MAX_LIMIT=200
-```
-
-Lorsque `ALLDEBRID_CACHE_ONLY=true`, l'indexeur applique actuellement des limites plus strictes :
+URL Torznab complète :
 
 ```text
-default : 10
-maximum : 30
+http://sf-torznab-meili:8080/torznab/api
 ```
 
-afin de limiter les appels vers AllDebrid.
-
-## Performances
-
-Les recherches génériques utilisent une pré-sélection limitée de candidats avant la déduplication afin d'éviter de trier plusieurs centaines de milliers de lignes PostgreSQL.
-
-Les recherches par titre, TMDB et IMDb utilisent leur logique dédiée.
-
-Le fichier :
+Depuis l'hôte :
 
 ```text
-sql/recommended_indexes.sql
+http://127.0.0.1:8788/torznab/api
 ```
 
-contient des index PostgreSQL optionnels pouvant améliorer certaines recherches.
+Les deux indexeurs peuvent être activés simultanément.
 
-Toujours vérifier les index déjà présents avant d'en créer de nouveaux.
+---
 
-## Sécurité
+# Tests
 
-Le fichier `.env` doit rester local et être exclu de Git.
-
-Les éléments suivants ne doivent jamais être publiés :
-
-* `DATABASE_URL` contenant un mot de passe ;
-* `INDEXER_API_KEY` ;
-* `ALLDEBRID_API_KEY` ;
-* toute autre clé ou information d'authentification.
-
-Une clé aléatoire forte peut être générée avec :
+## PostgreSQL — capacités
 
 ```bash
-openssl rand -hex 32
+curl \
+  "http://127.0.0.1:8787/torznab/api?t=caps&apikey=YOUR_POSTGRES_API_KEY"
+```
+
+---
+
+## Meilisearch — capacités
+
+```bash
+curl \
+  "http://127.0.0.1:8788/torznab/api?t=caps&apikey=YOUR_MEILI_API_KEY"
+```
+
+---
+
+## Recherche PostgreSQL
+
+```bash
+curl \
+  "http://127.0.0.1:8787/torznab/api?t=search&q=Iron%20Man%203&apikey=YOUR_POSTGRES_API_KEY"
+```
+
+---
+
+## Recherche Meilisearch
+
+```bash
+curl \
+  "http://127.0.0.1:8788/torznab/api?t=search&q=Iron%20Man%203&apikey=YOUR_MEILI_API_KEY"
+```
+
+---
+
+# Vérification du broker
+
+Le broker ne publie pas de port sur l'hôte.
+
+Test depuis son conteneur :
+
+```bash
+docker exec sf-alldebrid-broker \
+  python -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/health").read().decode())'
+```
+
+Une réponse saine contient notamment :
+
+```json
+{
+  "status": "ok",
+  "redis": true,
+  "postgres": true,
+  "alldebrid_key": true
+}
+```
+
+---
+
+# Vérification cleanup AllDebrid
+
+```bash
+docker exec sfr-redis-dev \
+  redis-cli ZCARD \
+  sf:torznab:alldebrid:cleanup
+```
+
+La file peut augmenter temporairement pendant ou juste après des recherches.
+
+Elle doit ensuite revenir à :
+
+```text
+0
+```
+
+---
+
+# Logs
+
+PostgreSQL :
+
+```bash
+docker logs --tail 200 sf-torznab
+```
+
+Meilisearch :
+
+```bash
+docker logs --tail 200 sf-torznab-meili
+```
+
+Broker :
+
+```bash
+docker logs --tail 200 sf-alldebrid-broker
+```
+
+---
+
+# Mise à jour
+
+Pour utiliser une nouvelle version publiée :
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Puis :
+
+```bash
+docker compose ps
+```
+
+---
+
+# Sécurité
+
+Ne jamais publier :
+
+```text
+.env
+ALLDEBRID_API_KEY
+ALLDEBRID_BROKER_TOKEN
+INDEXER_API_KEY
+MEILI_INDEXER_API_KEY
+MEILI_TORZNAB_SEARCH_KEY
+mot de passe contenu dans DATABASE_URL
+```
+
+Le fichier public de configuration est :
+
+```text
+.env.example
+```
+
+Il ne doit contenir que des exemples et des valeurs factices.
+
+---
+
+# Structure du dépôt
+
+```text
+.
+├── app/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── meili_main.py
+│   ├── alldebrid_broker.py
+│   └── alldebrid_global_quota.py
+├── .env.example
+├── .github/
+│   └── workflows/
+│       └── docker-publish.yml
+├── .gitignore
+├── docker-compose.yml
+├── Dockerfile
+├── README.md
+└── requirements.txt
+```
+
+---
+
+# Rôle des fichiers principaux
+
+| Fichier | Rôle |
+|---|---|
+| `app/main.py` | indexeur PostgreSQL |
+| `app/meili_main.py` | indexeur Meilisearch |
+| `app/alldebrid_broker.py` | broker central AllDebrid |
+| `app/alldebrid_global_quota.py` | quota Redis partagé |
+| `docker-compose.yml` | lancement des trois services |
+| `Dockerfile` | construction de l'image commune |
+| `.env.example` | exemple de configuration publique |
+
+---
+
+# Publication Docker
+
+Le workflow GitHub Actions construit une image multi-architecture :
+
+```text
+linux/amd64
+linux/arm64
+```
+
+Les registries prévus sont :
+
+```text
+Docker Hub
+GitHub Container Registry
+```
+
+L'image contient toutes les applications.
+
+Le service réellement exécuté est choisi dans `docker-compose.yml` :
+
+```text
+app.main:app
+app.meili_main:app
+app.alldebrid_broker:app
+```
+
+---
+
+# Résumé
+
+```text
+1 dépôt
+1 Dockerfile
+1 requirements.txt
+1 docker-compose.yml
+1 image Docker
+
+3 conteneurs
+├── sf-torznab
+├── sf-torznab-meili
+└── sf-alldebrid-broker
+
+2 indexeurs Prowlarr
+├── PostgreSQL : port 8787
+└── Meilisearch : port 8788
+
+1 broker AllDebrid
+├── pas de port hôte
+├── cache partagé
+├── quota partagé
+├── single-flight
+├── batching
+└── cleanup des magnets temporaires
 ```
